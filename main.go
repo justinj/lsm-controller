@@ -141,12 +141,12 @@ func main() {
 		return float64(w) / dt
 	})
 
-	pid := newPidController(1, 0.1, 0.00, 1, d.health, func(control float64) {
-		d.throttle = -time.Second * time.Duration(control)
+	pid := newPidController(1, 0.4, 0.00, 1, d.health, func(control float64) {
+		d.throttle = time.Duration(-float64(time.Second) * control)
 	})
 	go pid.run(s)
 
-	const writesPerSecond = 5000
+	const writesPerSecond = 2000
 	for elapsed() < 10.0 {
 		d.write(1)
 		time.Sleep(time.Second / writesPerSecond)
@@ -178,11 +178,12 @@ type db struct {
 	config       config
 	memtableSize int
 	// drained at each stats flush
-	writes   int
-	levels   [][]sst
-	nextId   int
-	stats    *stats
-	throttle time.Duration
+	writes    int
+	levels    [][]sst
+	nextId    int
+	stats     *stats
+	throttle  time.Duration
+	compacted map[int]struct{}
 
 	flushJobs      chan flushJob
 	compactionJobs chan compactionJob
@@ -197,6 +198,7 @@ func newDb(c config, s *stats) *db {
 		flushJobs:      make(chan flushJob, 100),
 		compactionJobs: make(chan compactionJob, 100),
 		stats:          s,
+		compacted:      make(map[int]struct{}),
 	}
 }
 
@@ -226,14 +228,19 @@ func (d *db) installSst(prevSsts []sst, s sst, level int) {
 
 	// Now if any level is too big, compact it.
 	for i := range d.levels {
-		if len(d.levels[i]) > maxSstsInLevel {
-			var totalSize int
-			for _, s := range d.levels[i] {
-				totalSize += s.size
+		compactibleSsts := make([]sst, 0, len(d.levels[i]))
+		for _, s := range d.levels[i] {
+			if _, ok := d.compacted[s.id]; !ok {
+				compactibleSsts = append(compactibleSsts, s)
+			}
+		}
+		if len(compactibleSsts) > maxSstsInLevel {
+			for _, s := range compactibleSsts {
+				d.compacted[s.id] = struct{}{}
 			}
 			select {
 			case d.compactionJobs <- compactionJob{
-				ssts:        d.levels[i],
+				ssts:        compactibleSsts,
 				targetLevel: i + 1,
 			}:
 			default:
@@ -271,20 +278,12 @@ func (d *db) runFlusher() {
 
 func (d *db) runCompactor() {
 	for job := range d.compactionJobs {
-		d.mu.Lock()
-
-		d.levels[0] = append(d.levels[0], sst{
-			size: d.config.maxMemtableSize,
-			id:   d.nextId,
-		})
-
-		d.mu.Unlock()
 		size := 0
 		for _, s := range job.ssts {
 			size += s.size
 		}
-		time.Sleep(time.Millisecond * time.Duration(size) / 100)
 		// do the compaction
+		time.Sleep(time.Millisecond * time.Duration(size))
 		d.mu.Lock()
 		d.nextId++
 		id := d.nextId + 1
@@ -299,6 +298,7 @@ func (d *db) runCompactor() {
 
 func (d *db) write(n int) {
 	time.Sleep(d.throttle)
+	// time.Sleep(2 * time.Millisecond)
 	d.memtableSize += n
 	d.writes += 1
 	d.mu.Lock()
